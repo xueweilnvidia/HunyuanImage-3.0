@@ -26,6 +26,13 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.utils import BaseOutput
 
+try:
+    from .group_norm_silu import apply_group_norm_silu
+except ImportError:
+    from group_norm_silu import apply_group_norm_silu
+
+import nvtx
+
 
 
 class DiagonalGaussianDistribution(object):
@@ -191,14 +198,13 @@ class ResnetBlock(nn.Module):
         if self.in_channels != self.out_channels:
             self.nin_shortcut = Conv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
+    @nvtx.annotate(message="ResnetBlock")
     def forward(self, x):
         h = x
-        h = self.norm1(h)
-        h = swish(h)
+        h = apply_group_norm_silu(h, self.norm1)
         h = self.conv1(h)
 
-        h = self.norm2(h)
-        h = swish(h)
+        h = apply_group_norm_silu(h, self.norm2)
         h = self.conv2(h)
 
         if self.in_channels != self.out_channels:
@@ -330,7 +336,9 @@ class Encoder(nn.Module):
 
         self.gradient_checkpointing = False
 
+    @nvtx.annotate(message="Encoder")
     def forward(self, x: Tensor) -> Tensor:
+        
         with torch.no_grad():
             use_checkpointing = bool(self.training and self.gradient_checkpointing)
 
@@ -350,8 +358,7 @@ class Encoder(nn.Module):
             # end
             group_size = self.block_out_channels[-1] // (2 * self.z_channels)
             shortcut = rearrange(h, "b (c r) f h w -> b c r f h w", r=group_size).mean(dim=2)
-            h = self.norm_out(h)
-            h = swish(h)
+            h = apply_group_norm_silu(h, self.norm_out)
             h = self.conv_out(h)
             h += shortcut
         return h
@@ -412,6 +419,7 @@ class Decoder(nn.Module):
         self.gradient_checkpointing = False
 
 
+    @nvtx.annotate(message="Decoder")
     def forward(self, z: Tensor) -> Tensor:
         with torch.no_grad():
             use_checkpointing = bool(self.training and self.gradient_checkpointing)
@@ -429,8 +437,7 @@ class Decoder(nn.Module):
                 if hasattr(self.up[i_level], "upsample"):
                     h = forward_with_checkpointing(self.up[i_level].upsample, h, use_checkpointing=use_checkpointing)
             # end
-            h = self.norm_out(h)
-            h = swish(h)
+            h = apply_group_norm_silu(h, self.norm_out)
             h = self.conv_out(h)
         return h
 
@@ -499,7 +506,8 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
         self.use_compile = False
 
-        self.empty_cache = torch.empty(0, device="cuda")
+        empty_cache_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.empty_cache = torch.empty(0, device=empty_cache_device)
 
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (Encoder, Decoder)):
