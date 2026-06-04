@@ -39,7 +39,16 @@ try:
 except ImportError:
     fused_downsample_dcae_post = None
 
+try:
+    try:
+        from .upsample_dcae_triton import fused_upsample_dcae_post
+    except ImportError:
+        from upsample_dcae_triton import fused_upsample_dcae_post
+except ImportError:
+    fused_upsample_dcae_post = None
+
 _USE_TRITON_DCAE = os.environ.get("HUNYUAN_USE_TRITON_DOWNSAMPLE_DCAE", "1") != "0"
+_USE_TRITON_UPSAMPLE_DCAE = os.environ.get("HUNYUAN_USE_TRITON_UPSAMPLE_DCAE", "1") != "0"
 
 import nvtx
 
@@ -299,9 +308,23 @@ class UpsampleDCAE(nn.Module):
         self.add_temporal_upsample = add_temporal_upsample
         self.repeats = factor * out_channels // in_channels
 
+    @nvtx.annotate(message="UpsampleDCAE")
     def forward(self, x: Tensor):
         r1 = 2 if self.add_temporal_upsample else 1
         h = self.conv(x)
+
+        if (
+            _USE_TRITON_UPSAMPLE_DCAE
+            and fused_upsample_dcae_post is not None
+            and x.is_cuda
+            and x.is_contiguous(memory_format=torch.channels_last_3d)
+        ):
+            if not h.is_contiguous(memory_format=torch.channels_last_3d):
+                h = h.contiguous(memory_format=torch.channels_last_3d)
+            return fused_upsample_dcae_post(
+                x, h, self.repeats, r1 * 4, self.add_temporal_upsample
+            )
+
         h = rearrange(h, "b (r1 r2 r3 c) f h w -> b c (f r1) (h r2) (w r3)", r1=r1, r2=2, r3=2)
         shortcut = x.repeat_interleave(repeats=self.repeats, dim=1)
         shortcut = rearrange(shortcut, "b (r1 r2 r3 c) f h w -> b c (f r1) (h r2) (w r3)", r1=r1, r2=2, r3=2)

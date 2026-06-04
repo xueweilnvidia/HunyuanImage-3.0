@@ -5,6 +5,8 @@ The official Hugging Face repos do not publish a separate VAE checkpoint file.
 This script downloads only the safetensors shards that contain ``vae.*`` keys,
 extracts those tensors into ``vae.safetensors``, then optionally runs a small
 encode/decode test without loading the 80B main model.
+
+HUNYUAN_USE_TRITON_DOWNSAMPLE_DCAE=1  HUNYUAN_USE_TRITON_UPSAMPLE_DCAE=1 HUNYUAN_USE_TRITON_GROUP_NORM_SILU=1 python test_vae_standalone.py --skip-download --output-dir ./HunyuanImage-3-VAE  --image assets/demo_instruct_imgs/input_0_0.png  --size auto --device cuda --dtype float16 --warmup-runs 3 --timing-runs 10
 """
 
 from __future__ import annotations
