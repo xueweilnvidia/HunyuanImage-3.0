@@ -27,9 +27,19 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.utils import BaseOutput
 
 try:
-    from .group_norm_silu import apply_group_norm_silu
+    from .groupnorm_silu_nhwc import apply_group_norm_silu_nhwc as apply_group_norm_silu
 except ImportError:
-    from group_norm_silu import apply_group_norm_silu
+    from groupnorm_silu_nhwc import apply_group_norm_silu_nhwc as apply_group_norm_silu
+
+try:
+    try:
+        from .downsample_dcae_triton import fused_downsample_dcae_post
+    except ImportError:
+        from downsample_dcae_triton import fused_downsample_dcae_post
+except ImportError:
+    fused_downsample_dcae_post = None
+
+_USE_TRITON_DCAE = os.environ.get("HUNYUAN_USE_TRITON_DOWNSAMPLE_DCAE", "1") != "0"
 
 import nvtx
 
@@ -200,6 +210,7 @@ class ResnetBlock(nn.Module):
 
     @nvtx.annotate(message="ResnetBlock")
     def forward(self, x):
+        x = x.to(memory_format=torch.channels_last_3d)
         h = x
         h = apply_group_norm_silu(h, self.norm1)
         h = self.conv1(h)
@@ -241,9 +252,23 @@ class DownsampleDCAE(nn.Module):
         self.add_temporal_downsample = add_temporal_downsample
         self.group_size = factor * in_channels // out_channels
 
+    @nvtx.annotate(message="DownsampleDCAE")
     def forward(self, x: Tensor):
         r1 = 2 if self.add_temporal_downsample else 1
         h = self.conv(x)
+
+        if (
+            _USE_TRITON_DCAE
+            and fused_downsample_dcae_post is not None
+            and x.is_cuda
+            and x.is_contiguous(memory_format=torch.channels_last_3d)
+        ):
+            if not h.is_contiguous(memory_format=torch.channels_last_3d):
+                h = h.contiguous(memory_format=torch.channels_last_3d)
+            return fused_downsample_dcae_post(
+                x, h, self.group_size, r1 * 4, self.add_temporal_downsample
+            )
+
         h = rearrange(h, "b c (f r1) (h r2) (w r3) -> b (r1 r2 r3 c) f h w", r1=r1, r2=2, r3=2)
         shortcut = rearrange(x, "b c (f r1) (h r2) (w r3) -> b (r1 r2 r3 c) f h w", r1=r1, r2=2, r3=2)
 
@@ -342,6 +367,7 @@ class Encoder(nn.Module):
         with torch.no_grad():
             use_checkpointing = bool(self.training and self.gradient_checkpointing)
 
+            x = x.to(memory_format=torch.channels_last_3d)
             # downsampling
             h = self.conv_in(x)
             for i_level in range(len(self.block_out_channels)):
@@ -424,8 +450,10 @@ class Decoder(nn.Module):
         with torch.no_grad():
             use_checkpointing = bool(self.training and self.gradient_checkpointing)
             # z to block_in
+            z = z.to(memory_format=torch.channels_last_3d)
             repeats = self.block_out_channels[0] // (self.z_channels)
-            h = self.conv_in(z) + z.repeat_interleave(repeats=repeats, dim=1)
+            shortcut = z.repeat_interleave(repeats=repeats, dim=1).to(memory_format=torch.channels_last_3d)
+            h = self.conv_in(z) + shortcut
             # middle
             h = forward_with_checkpointing(self.mid.block_1, h, use_checkpointing=use_checkpointing)
             h = forward_with_checkpointing(self.mid.attn_1, h, use_checkpointing=use_checkpointing)
